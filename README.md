@@ -1,88 +1,120 @@
-# 雅虎财经新闻定时推送系统
+# 雅虎财经新闻推送系统
 
-## 设置定时任务 (Cron)
+基于 Yahoo Finance RSS 的新闻抓取与中文报告生成工具。
 
-### 方法1: 使用系统Cron (Linux/Mac)
+功能概览：
+- 多 RSS 源抓取（综合 + 个股）
+- 正文多策略解析（含 RSS 摘要兜底）
+- 英文自动翻译为中文
+- 自动分类（政策/宏观经济、行业动态、公司新闻）
+- 生成高质量 Word 报告
+- 可选推送到企业微信、钉钉、Slack、Telegram
 
-编辑crontab文件:
-```bash
-crontab -e
-```
+## 1. 环境要求
 
-添加以下行（每天早上9点执行）:
-```
-0 9 * * * cd /mnt/okcomputer/output/finance_news_bot && /usr/bin/python3 news_bot.py >> /mnt/okcomputer/output/finance_news_bot/cron.log 2>&1
-```
+- Python 3.9+
+- 可访问外网（用于 RSS 抓取与翻译）
 
-### 方法2: 使用Python schedule库
-
-安装schedule:
-```bash
-pip install schedule
-```
-
-运行调度脚本:
-```bash
-python3 scheduler.py
-```
-
-### 方法3: 使用系统服务 (systemd)
-
-创建服务文件 `/etc/systemd/system/finance-news.service`:
-```ini
-[Unit]
-Description=Finance News Daily Push
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 /mnt/okcomputer/output/finance_news_bot/news_bot.py
-User=your_username
-
-[Install]
-WantedBy=multi-user.target
-```
-
-创建定时器文件 `/etc/systemd/system/finance-news.timer`:
-```ini
-[Unit]
-Description=Run Finance News Bot daily at 9:00 AM
-
-[Timer]
-OnCalendar=*-*-* 09:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-启用并启动定时器:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable finance-news.timer
-sudo systemctl start finance-news.timer
-```
-
-## 查看定时任务状态
+安装依赖：
 
 ```bash
-# 查看cron任务
-crontab -l
-
-# 查看systemd定时器
-systemctl list-timers --all
-
-# 查看日志
-journalctl -u finance-news.service
+pip install requests feedparser beautifulsoup4 deep-translator python-docx
 ```
 
-## 推送方式扩展
+## 2. 文件说明
 
-当前系统生成报告文件，可通过以下方式推送:
+- `news_bot_full.py`：主程序
+- `push_config.json`：推送配置
+- `output/`：最新输出目录
+- `history/`：历史报告目录
 
-1. **邮件推送**: 配置SMTP服务器
-2. **企业微信**: 使用Webhook
-3. **钉钉**: 使用Webhook
-4. **Slack**: 使用Incoming Webhook
-5. **Telegram**: 使用Bot API
-6. **短信**: 使用云服务商SMS API
+## 3. 推送配置（可选）
+
+编辑 `push_config.json`：
+
+```json
+{
+  "wechat_work_webhook": "",
+  "dingtalk_webhook": "",
+  "slack_webhook": "",
+  "telegram_bot_token": "",
+  "telegram_chat_id": ""
+}
+```
+
+说明：
+- 不填则对应渠道不会推送。
+- 建议至少配置 1 个渠道用于接收摘要通知。
+
+## 4. 运行方式
+
+基础运行：
+
+```bash
+python news_bot_full.py
+```
+
+常用参数：
+
+```bash
+python news_bot_full.py --max-per-category 5 --max-total 20 --report-format word --no-push
+```
+
+参数说明：
+- `--max-per-category`：每个分类最多处理条数，默认 `5`
+- `--max-total`：总处理条数上限，默认 `20`
+- `--output-dir`：输出目录，默认 `output/`
+- `--report-format`：
+  - `word`：仅生成 Word（默认，推荐）
+  - `all`：生成 Word + TXT + JSON
+- `--no-push`：只生成报告，不执行推送
+
+## 5. 输出结果
+
+默认模式（`--report-format word`）：
+- `output/latest_report.docx`
+- `output/history/news_report_YYYYMMDD.docx`
+
+完整模式（`--report-format all`）额外生成：
+- `output/latest_summary.json`
+- `output/latest_detail.txt`
+- `output/latest_summary.txt`
+- `output/history/news_summary_YYYYMMDD.json`
+- `output/history/news_detail_YYYYMMDD.txt`
+- `output/history/news_summary_YYYYMMDD.txt`
+
+## 6. 运行流程
+
+程序执行顺序：
+1. 拉取 RSS 新闻
+2. 按关键词分类
+3. 抓取正文
+4. 翻译为中文
+5. 生成报告
+6. 发送摘要推送（可选）
+
+## 7. 常见问题
+
+1. 抓取失败或正文很短
+- 可能是目标页面结构变化或网络问题，程序会自动回退到 RSS 摘要。
+
+2. 翻译失败
+- 程序内置重试机制，连续失败时会保留原文。
+
+3. 没有收到推送
+- 检查 `push_config.json` 是否填写正确。
+- 使用 `--no-push` 时不会推送。
+
+## 8. 推荐命令
+
+日常只要 Word 报告：
+
+```bash
+python news_bot_full.py --report-format word --no-push
+```
+
+需要完整归档数据：
+
+```bash
+python news_bot_full.py --report-format all
+```

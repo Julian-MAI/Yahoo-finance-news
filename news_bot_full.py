@@ -6,6 +6,7 @@
 """
 
 import json
+import argparse
 import requests
 import feedparser
 import time
@@ -13,6 +14,7 @@ import re
 import os
 import logging
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from docx import Document
@@ -85,6 +87,8 @@ CATEGORY_KEYWORDS = {
 MIN_PER_CATEGORY = 1
 MAX_ARTICLE_CHARS = 3000
 TRANSLATE_CHUNK_SIZE = 4500
+REQUEST_MAX_RETRIES = 3
+REQUEST_RETRY_DELAY = 1.2
 
 # ─── 广告 / 无关内容过滤规则 ───
 # 包含任一关键词的行将被剔除（大小写不敏感）
@@ -209,6 +213,47 @@ def clean_article_text(text, lang='en'):
     return '\n'.join(cleaned)
 
 
+def parse_published_time(published):
+    """将RSS发布时间解析为datetime，失败时返回最小时间"""
+    if not published:
+        return datetime.min
+    try:
+        dt = parsedate_to_datetime(published)
+        # 统一为不含时区的时间，便于排序比较
+        if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+            return dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        return datetime.min
+
+
+def safe_get(url, headers=None, timeout=15, session=None, allow_redirects=True,
+             max_retries=REQUEST_MAX_RETRIES):
+    """带重试的GET请求，返回Response或None"""
+    client = session if session is not None else requests
+    for attempt in range(max_retries):
+        try:
+            resp = client.get(url, headers=headers, timeout=timeout, allow_redirects=allow_redirects)
+            if resp.status_code == 200:
+                return resp
+            # 429/5xx视为可重试
+            if resp.status_code == 429 or resp.status_code >= 500:
+                logger.warning(f"请求失败(可重试) {resp.status_code}: {url}")
+            else:
+                logger.warning(f"请求失败(不重试) {resp.status_code}: {url}")
+                return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            logger.warning(f"请求异常(尝试{attempt + 1}): {url} | {e}")
+        except Exception as e:
+            logger.warning(f"请求异常(终止): {url} | {e}")
+            return None
+
+        if attempt < max_retries - 1:
+            time.sleep(REQUEST_RETRY_DELAY * (attempt + 1))
+
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 翻译模块
 # ══════════════════════════════════════════════════════════════════════
@@ -279,33 +324,39 @@ def fetch_rss_entries():
     """从多个Yahoo Finance RSS源获取新闻条目"""
     all_entries = []
     seen_links = set()
+    seen_titles = set()
+
+    def _normalize_title(title):
+        return re.sub(r'\s+', ' ', (title or '').strip().lower())
 
     # 1) 综合RSS源
     for rss_url in RSS_FEEDS:
         try:
             logger.info(f"正在获取RSS: {rss_url}")
-            resp = requests.get(rss_url, headers=HEADERS, timeout=15)
-            if resp.status_code == 200:
+            resp = safe_get(rss_url, headers=HEADERS, timeout=15)
+            if resp is not None:
                 feed = feedparser.parse(resp.text)
                 for entry in feed.entries:
                     link = entry.get('link', '')
-                    if link and link not in seen_links:
+                    title = entry.get('title', '')
+                    title_key = _normalize_title(title)
+                    if link and link not in seen_links and title_key not in seen_titles:
                         seen_links.add(link)
+                        seen_titles.add(title_key)
                         # 提取RSS自带的摘要/描述
                         rss_summary = entry.get('summary', '') or entry.get('description', '')
                         # 清洗 HTML 标签
                         if rss_summary:
                             rss_summary = BeautifulSoup(rss_summary, 'html.parser').get_text(strip=True)
                         all_entries.append({
-                            'title': entry.get('title', ''),
+                            'title': title,
                             'link': link,
                             'published': entry.get('published', ''),
+                            'published_dt': parse_published_time(entry.get('published', '')),
                             'source': 'Yahoo Finance',
                             'ticker': '',
                             'rss_summary': rss_summary,
                         })
-            else:
-                logger.warning(f"RSS请求失败 {rss_url}: HTTP {resp.status_code}")
         except Exception as e:
             logger.error(f"RSS获取异常 {rss_url}: {e}")
 
@@ -313,26 +364,33 @@ def fetch_rss_entries():
     for ticker in TICKERS:
         rss_url = TICKER_RSS_TEMPLATE.format(ticker=ticker)
         try:
-            resp = requests.get(rss_url, headers=HEADERS, timeout=10)
-            if resp.status_code == 200:
+            resp = safe_get(rss_url, headers=HEADERS, timeout=10)
+            if resp is not None:
                 feed = feedparser.parse(resp.text)
                 for entry in feed.entries[:5]:
                     link = entry.get('link', '')
-                    if link and link not in seen_links:
+                    title = entry.get('title', '')
+                    title_key = _normalize_title(title)
+                    if link and link not in seen_links and title_key not in seen_titles:
                         seen_links.add(link)
+                        seen_titles.add(title_key)
                         rss_summary = entry.get('summary', '') or entry.get('description', '')
                         if rss_summary:
                             rss_summary = BeautifulSoup(rss_summary, 'html.parser').get_text(strip=True)
                         all_entries.append({
-                            'title': entry.get('title', ''),
+                            'title': title,
                             'link': link,
                             'published': entry.get('published', ''),
+                            'published_dt': parse_published_time(entry.get('published', '')),
                             'source': 'Yahoo Finance',
                             'ticker': ticker,
                             'rss_summary': rss_summary,
                         })
         except Exception as e:
             logger.warning(f"个股RSS获取失败 {ticker}: {e}")
+
+    # 按发布时间从新到旧排序
+    all_entries.sort(key=lambda x: x.get('published_dt', datetime.min), reverse=True)
 
     logger.info(f"RSS共获取 {len(all_entries)} 条不重复新闻")
     return all_entries
@@ -348,9 +406,8 @@ def scrape_article_body(url, rss_summary=''):
 
     text = ''
     try:
-        resp = session.get(url, timeout=20, allow_redirects=True)
-        if resp.status_code != 200:
-            logger.warning(f"HTTP {resp.status_code}: {url}")
+        resp = safe_get(url, timeout=20, session=session, allow_redirects=True)
+        if resp is None:
             return rss_summary[:MAX_ARTICLE_CHARS] if rss_summary else ''
 
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -1012,7 +1069,7 @@ def save_report_to_word(news_list, output_dir=None):
     return doc_path
 
 
-def save_report(news_list, output_dir=None):
+def save_report(news_list, output_dir=None, save_text_json=False):
     """保存报告到文件"""
     if output_dir is None:
         output_dir = OUTPUT_DIR
@@ -1023,59 +1080,62 @@ def save_report(news_list, output_dir=None):
 
     date_tag = datetime.now().strftime('%Y%m%d')
 
-    # 构建 JSON 数据（去除不需要序列化的大字段）
-    serializable = []
-    for item in news_list:
-        serializable.append({
-            'title_cn': item.get('title_cn', ''),
-            'title_en': item.get('title_en', ''),
-            'category': item.get('category', ''),
-            'ticker': item.get('ticker', ''),
-            'source': item.get('source', ''),
-            'published': item.get('published', ''),
-            'link': item.get('link', ''),
-            'body_cn': item.get('body_cn', ''),
-        })
+    if save_text_json:
+        # 构建 JSON 数据（去除不需要序列化的大字段）
+        serializable = []
+        for item in news_list:
+            serializable.append({
+                'title_cn': item.get('title_cn', ''),
+                'title_en': item.get('title_en', ''),
+                'category': item.get('category', ''),
+                'ticker': item.get('ticker', ''),
+                'source': item.get('source', ''),
+                'published': item.get('published', ''),
+                'link': item.get('link', ''),
+                'body_cn': item.get('body_cn', ''),
+            })
 
-    json_data = {
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'total_news': len(news_list),
-        'categories': {},
-        'all_news': serializable,
-    }
-    for category in ['政策/宏观经济', '行业动态', '公司新闻', '其他']:
-        cat_items = [n for n in news_list if n.get('category') == category]
-        if cat_items:
-            json_data['categories'][category] = {
-                'count': len(cat_items),
-                'headlines': [n.get('title_cn', '') for n in cat_items],
-            }
+        json_data = {
+            'date': datetime.now().strftime('%Y-%m-%d'),
+            'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_news': len(news_list),
+            'categories': {},
+            'all_news': serializable,
+        }
+        for category in ['政策/宏观经济', '行业动态', '公司新闻', '其他']:
+            cat_items = [n for n in news_list if n.get('category') == category]
+            if cat_items:
+                json_data['categories'][category] = {
+                    'count': len(cat_items),
+                    'headlines': [n.get('title_cn', '') for n in cat_items],
+                }
 
-    # 保存到 history
-    json_path = os.path.join(history_dir, f'news_summary_{date_tag}.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(json_data, f, ensure_ascii=False, indent=2)
-    logger.info(f"JSON 已保存: {json_path}")
+        # 保存到 history
+        json_path = os.path.join(history_dir, f'news_summary_{date_tag}.json')
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"JSON 已保存: {json_path}")
 
-    detail_path = os.path.join(history_dir, f'news_detail_{date_tag}.txt')
-    with open(detail_path, 'w', encoding='utf-8') as f:
-        f.write(format_report(news_list))
-    logger.info(f"详细报告已保存: {detail_path}")
+        detail_path = os.path.join(history_dir, f'news_detail_{date_tag}.txt')
+        with open(detail_path, 'w', encoding='utf-8') as f:
+            f.write(format_report(news_list))
+        logger.info(f"详细报告已保存: {detail_path}")
 
-    summary_path = os.path.join(history_dir, f'news_summary_{date_tag}.txt')
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        f.write(format_summary(news_list))
-    logger.info(f"摘要已保存: {summary_path}")
+        summary_path = os.path.join(history_dir, f'news_summary_{date_tag}.txt')
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write(format_summary(news_list))
+        logger.info(f"摘要已保存: {summary_path}")
 
-    # 保存 latest
-    with open(os.path.join(output_dir, 'latest_summary.json'), 'w', encoding='utf-8') as f:
-        json.dump(json_data, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(output_dir, 'latest_detail.txt'), 'w', encoding='utf-8') as f:
-        f.write(format_report(news_list))
-    with open(os.path.join(output_dir, 'latest_summary.txt'), 'w', encoding='utf-8') as f:
-        f.write(format_summary(news_list))
-    logger.info(f"最新报告已保存到 {output_dir}")
+        # 保存 latest
+        with open(os.path.join(output_dir, 'latest_summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(output_dir, 'latest_detail.txt'), 'w', encoding='utf-8') as f:
+            f.write(format_report(news_list))
+        with open(os.path.join(output_dir, 'latest_summary.txt'), 'w', encoding='utf-8') as f:
+            f.write(format_summary(news_list))
+        logger.info(f"最新文本/JSON报告已保存到 {output_dir}")
+    else:
+        logger.info("已启用精简输出模式: 仅保存Word文档")
 
     # 保存Word文档
     save_report_to_word(news_list, output_dir)
@@ -1086,6 +1146,20 @@ def save_report(news_list, output_dir=None):
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    parser = argparse.ArgumentParser(description='雅虎财经新闻推送系统')
+    parser.add_argument('--max-per-category', type=int, default=5, help='每个分类最多抓取条数')
+    parser.add_argument('--max-total', type=int, default=20, help='总抓取条数上限')
+    parser.add_argument('--output-dir', type=str, default=OUTPUT_DIR, help='输出目录')
+    parser.add_argument('--report-format', choices=['word', 'all'], default='word',
+                        help='报告输出格式: word(仅Word) 或 all(Word+TXT+JSON)')
+    parser.add_argument('--no-push', action='store_true', help='仅生成报告，不推送')
+    args = parser.parse_args()
+
+    if args.max_per_category <= 0:
+        args.max_per_category = 5
+    if args.max_total <= 0:
+        args.max_total = 20
+
     print(f"\n{'=' * 60}")
     print(f"雅虎财经新闻推送系统 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'=' * 60}\n")
@@ -1117,14 +1191,15 @@ def main():
     for cat, cnt in cat_counts.items():
         print(f"  {cat}: {cnt} 条")
 
-    # 选择要抓取全文的新闻：每个分类最多取5条，共最多20条
+    # 选择要抓取全文的新闻：每个分类最多取N条，共最多M条
     selected = []
     for category in ['政策/宏观经济', '行业动态', '公司新闻', '其他']:
         cat_items = [e for e in rss_entries if e['category'] == category]
-        selected.extend(cat_items[:5])
+        cat_items.sort(key=lambda x: x.get('published_dt', datetime.min), reverse=True)
+        selected.extend(cat_items[:args.max_per_category])
 
-    if len(selected) > 20:
-        selected = selected[:20]
+    if len(selected) > args.max_total:
+        selected = selected[:args.max_total]
     print(f"  已选择 {len(selected)} 条新闻进行全文抓取和翻译")
 
     # ── 第3步：抓取全文 ──
@@ -1164,7 +1239,7 @@ def main():
 
     # ── 第5步：生成报告并保存 ──
     print(f"\n▶ 第5步: 生成报告并保存...")
-    save_report(selected)
+    save_report(selected, output_dir=args.output_dir, save_text_json=(args.report_format == 'all'))
 
     # ── 打印摘要 ──
     print('\n' + '=' * 70)
@@ -1179,13 +1254,16 @@ def main():
     print(format_report(selected))
 
     # ── 推送 ──
-    print("\n▶ 推送通知...")
-    pusher = NewsPusher(CONFIG_PATH)
-    results = pusher.push_all(format_summary(selected))
-    if results:
-        print(f"  推送结果: {results}")
+    if args.no_push:
+        print("\n▶ 已跳过推送（--no-push）")
     else:
-        print("  未配置推送渠道，仅保存到文件")
+        print("\n▶ 推送通知...")
+        pusher = NewsPusher(CONFIG_PATH)
+        results = pusher.push_all(format_summary(selected))
+        if results:
+            print(f"  推送结果: {results}")
+        else:
+            print("  未配置推送渠道，仅保存到文件")
 
     print("\n✅ 新闻推送任务完成!")
 
